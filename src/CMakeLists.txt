@@ -22,7 +22,9 @@ set(BINARY_DIR "${CMAKE_BINARY_DIR}")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${BINARY_DIR}/bin")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${BINARY_DIR}/lib")
 
-
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
+set(CMAKE_AUTOUIC ON)
 
 ################################################################################
 ## TARGET
@@ -43,9 +45,10 @@ endif()
 ## LINK LIBRARIES
 ## linking all dependencies
 ################################################################################
-find_package(OpenCV REQUIRED)
-    include_directories(${OpenCV_INCLUDE_DIRS})
-    target_link_libraries(${PROJECT_NAME} ${OpenCV_LIBS})
+
+find_package(Qt6 REQUIRED COMPONENTS Widgets)
+target_link_libraries(${PROJECT_NAME} Qt6::Widgets)
+
 
 
 ################################################################################
