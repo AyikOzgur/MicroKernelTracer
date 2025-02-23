@@ -3,6 +3,7 @@
 #include <array>
 #include <cstring>
 #include <thread>
+#include <set>
 #include <mutex>
 #include "SerialPort.h"
 #include "utils.h"
@@ -76,29 +77,33 @@ protected:
     const int leftMargin = 100;  // Margin reserved for thread labels.
     const int baseY = 300;       // Y offset where the bars start.
 
+    // Set of thread IDs that were actually used.
+    std::set<int> usedThreadIds;
+
     // Draw all events in the buffer using the horizontal offset.
     for (size_t i = 0; i < PACKET_RECORD_COUNT; ++i)
     {
       int tid = events[i].threadId;
-      if (tid >= 0 && tid < 3) // Only visualize threads 0, 1, and 2.
+      usedThreadIds.insert(tid);
+
+      // Calculate x-position with the horizontal scrolling offset.
+      int x = leftMargin + static_cast<int>(i) * segmentWidth - m_horizontalOffset;
+      int y = baseY + tid * barHeight;  // Each thread gets its own row based on its threadId.
+      QRect rect(x, y, segmentWidth, barHeight);
+      QColor rectColor = (events[i].eventType == 1) ? Qt::red : Qt::green;
+
+      // Only draw if the rectangle is within the visible region.
+      if (rect.right() >= leftMargin && rect.left() <= width())
       {
-        // Calculate x-position with the horizontal scrolling offset.
-        int x = leftMargin + static_cast<int>(i) * segmentWidth - m_horizontalOffset;
-        int y = baseY + tid * barHeight;
-        QRect rect(x, y, segmentWidth, barHeight);
-        // Only draw if the rectangle is within the visible region.
-        if (rect.right() >= leftMargin && rect.left() <= width())
-        {
-          painter.fillRect(rect, Qt::green);
-          QString text = QString::number(events[i].deltaTime);
-          painter.setPen(Qt::black);
-          painter.drawText(rect.adjusted(5, 0, 0, 0), Qt::AlignVCenter | Qt::AlignLeft, text);
-        }
+        painter.fillRect(rect, rectColor);
+        QString text = QString::number(events[i].deltaTime);
+        painter.setPen(Qt::black);
+        painter.drawText(rect.adjusted(5, 0, 0, 0), Qt::AlignVCenter | Qt::AlignLeft, text);
       }
     }
 
-    // Draw fixed thread labels to the left.
-    for (int tid = 0; tid < 3; ++tid)
+    // Draw labels for the threads that were actually used.
+    for (int tid : usedThreadIds)
     {
       QString label = QString("Thread %1").arg(tid);
       int barY = baseY + tid * barHeight;
