@@ -11,6 +11,7 @@ public:
   bool open(std::string portName, int baudRate = CBR_9600);
   void close();
   int read(uint8_t *buffer, size_t size);
+  bool isOpen() const;
 
 private:
   HANDLE m_hSerial;

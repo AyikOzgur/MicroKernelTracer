@@ -64,7 +64,7 @@ bool SerialPort::open(std::string portName, int baudRate)
   COMMTIMEOUTS timeouts = {0};
   timeouts.ReadIntervalTimeout = 50;        // Maximum time between bytes (ms)
   timeouts.ReadTotalTimeoutConstant = 50;   // Constant timeout (ms)
-  timeouts.ReadTotalTimeoutMultiplier = 10; // Per-byte timeout (ms)
+  timeouts.ReadTotalTimeoutMultiplier = 1;  // Per-byte timeout (ms)
   if (!SetCommTimeouts(m_hSerial, &timeouts))
   {
     close();
@@ -94,4 +94,9 @@ int SerialPort::read(uint8_t *buffer, size_t size)
   }
 
   return bytesRead;
+}
+
+bool SerialPort::isOpen() const
+{
+  return m_hSerial != INVALID_HANDLE_VALUE;
 }
