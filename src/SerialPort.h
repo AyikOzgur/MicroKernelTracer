@@ -8,7 +8,7 @@ public:
   SerialPort();
   ~SerialPort();
 
-  bool open(std::string portName);
+  bool open(std::string portName, int baudRate = CBR_9600);
   void close();
   int read(uint8_t *buffer, size_t size);
 

@@ -5,6 +5,7 @@
 #include <thread>
 #include <mutex>
 #include "SerialPort.h"
+#include "utils.h"
 
 #include <QApplication>
 #include <QWidget>
@@ -181,7 +182,7 @@ void receivingTracerDataThreadFunc()
   SerialPort serial;
   if (!serial.open(g_portName))
   {
-    std::cerr << "Error opening : " << g_portName << std::endl;
+    std::cerr << LOG_LOCATION <<"Error opening serial port : " << g_portName << std::endl;
     exit(1);
   }
 
