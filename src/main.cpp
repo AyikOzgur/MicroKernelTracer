@@ -6,9 +6,7 @@
 #include <set>
 #include <mutex>
 #include <atomic>
-
-#include "SerialPort.h"
-#include "utils.h"
+#include <chrono>
 
 #include <QApplication>
 #include <QWidget>
@@ -22,13 +20,10 @@
 #include <QResizeEvent>
 #include <QLineEdit>
 #include <QPushButton>
-#include <QSpinBox>
+#include <QComboBox>
 
-// Global serial settings.
-std::string g_portName = "COM6";
-int g_baudRate = 115200;
-std::atomic<bool> g_stopReceiver{false};
-std::thread* g_receivingThread = nullptr;
+#include "SerialPort.h"
+#include "utils.h"
 
 // Define the packed structure.
 #pragma pack(push, 1)
@@ -40,42 +35,68 @@ struct TraceEvent_t
 };
 #pragma pack(pop)
 
-const int PACKET_RECORD_COUNT = 1023;
-const int BUFFER_SIZE = PACKET_RECORD_COUNT * sizeof(TraceEvent_t);
+std::string g_portName = "COM6";
+int g_baudRate = 9600;
 
-// Global shared events and mutex.
+/// Atomic flags for controlling the connection.
+std::thread g_receivingThread;
+std::atomic<bool> g_stopReceiver{false};
+std::atomic<bool> g_connectionRequested{false};
+std::atomic<bool> g_restartNeeded{false};
+
+constexpr int PACKET_RECORD_COUNT = 1023;
+constexpr int BUFFER_SIZE = PACKET_RECORD_COUNT * sizeof(TraceEvent_t);
+
+/// Global shared events and its mutex.
 TraceEvent_t g_sharedEvents[PACKET_RECORD_COUNT];
 std::mutex g_sharedEventsMutex;
 
-// Receiver thread function.
+/// Thread function that receives data from the serial port and updates the shared buffer.
 void receivingTracerDataThreadFunc()
 {
-  SerialPort serial;
-  // Assume that SerialPort::open can accept a port name and a baud rate.
-  if (!serial.open(g_portName, g_baudRate))
+  SerialPort serialPort;
+  uint8_t buffer[BUFFER_SIZE];
+
+  while (!g_stopReceiver.load())
   {
-    std::cerr << LOG_LOCATION << "Error opening serial port: " << g_portName << std::endl;
-    return;
-  }
-
-  std::cout << "Connected to " << g_portName << " at " << g_baudRate << std::endl;
-
-  char buffer[BUFFER_SIZE];
-
-  while (!g_stopReceiver)
-  {
-    int bytesRead = serial.read(reinterpret_cast<uint8_t *>(buffer), BUFFER_SIZE);
-    if (bytesRead >= BUFFER_SIZE)
+    if (g_restartNeeded.load())
     {
-      std::lock_guard<std::mutex> lock(g_sharedEventsMutex);
-      std::memcpy(g_sharedEvents, buffer, BUFFER_SIZE);
+      if (serialPort.isOpen())
+        serialPort.close();
+
+      if (g_connectionRequested.load())
+      {
+        if (!serialPort.open(g_portName, g_baudRate))
+        {
+          std::cerr << LOG_LOCATION << "Error opening serial port: " << g_portName << std::endl;
+          std::this_thread::sleep_for(std::chrono::milliseconds(500));
+          continue;
+        }
+      }
+      g_restartNeeded.store(false);
+    }
+
+    if (serialPort.isOpen())
+    {
+      int bytesRead = serialPort.read(buffer, BUFFER_SIZE);
+      if (bytesRead >= BUFFER_SIZE)
+      {
+        std::lock_guard<std::mutex> lock(g_sharedEventsMutex);
+        std::memcpy(g_sharedEvents, buffer, BUFFER_SIZE);
+      }
+    }
+    else
+    {
+      // Not connected—sleep briefly.
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
   }
 
-  serial.close();
+  serialPort.close();
 }
 
-// Custom widget that performs the drawing.
+
+/// Custom widget that performs the drawing.
 class VisualizationWidget : public QWidget
 {
   Q_OBJECT
@@ -83,6 +104,7 @@ public:
   explicit VisualizationWidget(QWidget *parent = nullptr)
       : QWidget(parent), m_horizontalOffset(0)
   {
+    setMinimumWidth(1280);
     setMinimumHeight(720);
   }
 
@@ -97,13 +119,9 @@ protected:
   void paintEvent(QPaintEvent *event) override
   {
     Q_UNUSED(event);
-
-    // Copy shared events safely.
-    TraceEvent_t *events = new TraceEvent_t[PACKET_RECORD_COUNT];
-    {
-      std::lock_guard<std::mutex> lock(g_sharedEventsMutex);
-      std::memcpy(events, g_sharedEvents, BUFFER_SIZE);
-    }
+    g_sharedEventsMutex.lock();
+    std::memcpy(m_events, g_sharedEvents, BUFFER_SIZE);
+    g_sharedEventsMutex.unlock();
 
     QPainter painter(this);
     painter.fillRect(rect(), Qt::black);
@@ -115,24 +133,22 @@ protected:
 
     std::set<int> usedThreadIds;
 
-    // Draw all events and collect used thread IDs.
+    // Draw events and collect used thread IDs.
     for (size_t i = 0; i < PACKET_RECORD_COUNT; ++i)
     {
-      int tid = events[i].threadId;
+      int tid = m_events[i].threadId;
       usedThreadIds.insert(tid);
 
-      // Calculate x-position using horizontal scrolling.
       int x = leftMargin + static_cast<int>(i) * segmentWidth - m_horizontalOffset;
       int y = baseY + tid * barHeight;
       QRect rect(x, y, segmentWidth, barHeight);
 
       // Choose red for PENDSV events (eventType == 1), green otherwise.
-      QColor rectColor = (events[i].eventType == 1) ? Qt::red : Qt::green;
-
+      QColor rectColor = (m_events[i].eventType == 1) ? Qt::red : Qt::green;
       if (rect.right() >= leftMargin && rect.left() <= width())
       {
         painter.fillRect(rect, rectColor);
-        QString text = QString::number(events[i].deltaTime);
+        QString text = QString::number(m_events[i].deltaTime);
         painter.setPen(Qt::black);
         painter.drawText(rect.adjusted(5, 0, 0, 0), Qt::AlignVCenter | Qt::AlignLeft, text);
       }
@@ -151,14 +167,35 @@ protected:
       painter.drawText(10, textY, label);
     }
 
-    delete[] events;
+    // Draw legend in the top-right corner.
+    int legendWidth = 150;
+    int legendHeight = 50;
+    int legendX = width() - legendWidth - 10;  // 10px margin from right edge
+    int legendY = 10;                          // 10px from the top
+
+    // Draw a border around the legend.
+    painter.setPen(Qt::white);
+    painter.drawRect(legendX, legendY, legendWidth, legendHeight);
+
+    int boxSize = 15;
+    int spacing = 5;
+    int textOffset = boxSize + spacing;
+
+    // Legend for PENDSV (red)
+    painter.fillRect(legendX + spacing, legendY + spacing, boxSize, boxSize, Qt::red);
+    painter.drawText(legendX + textOffset, legendY + spacing + boxSize, "PENDSV scheduled");
+
+    // Legend for Normal (green)
+    painter.fillRect(legendX + spacing, legendY + spacing*2 + boxSize, boxSize, boxSize, Qt::green);
+    painter.drawText(legendX + textOffset, legendY + spacing*2 + boxSize*2, "Systick scheduled");
   }
 
 private:
   int m_horizontalOffset;
+  TraceEvent_t m_events[PACKET_RECORD_COUNT];
 };
 
-// Main window that contains the visualization widget, slider, and serial controls.
+/// Main window that contains the visualization widget, slider, and serial controls.
 class MainWindow : public QWidget
 {
   Q_OBJECT
@@ -167,61 +204,81 @@ public:
   {
     QVBoxLayout *mainLayout = new QVBoxLayout(this);
 
-    // Create a horizontal layout for serial port controls.
+    // Serial port controls layout.
     QHBoxLayout *serialLayout = new QHBoxLayout();
 
     m_portNameEdit = new QLineEdit(this);
     m_portNameEdit->setPlaceholderText("Serial Port (e.g., COM6)");
     m_portNameEdit->setText(QString::fromStdString(g_portName));
 
-    m_baudRateSpin = new QSpinBox(this);
-    m_baudRateSpin->setRange(300, 1000000);
-    m_baudRateSpin->setValue(g_baudRate);
+    m_baudRateCombo = new QComboBox(this);
+    // Populate standard baud rates.
+    QList<int> baudRates = {300, 600, 1200, 2400, 4800, 9600, 14400, 19200, 38400, 57600, 115200, 230400};
+    for (int rate : baudRates)
+      m_baudRateCombo->addItem(QString::number(rate), rate);
+    int defaultIndex = m_baudRateCombo->findData(g_baudRate);
+    if (defaultIndex >= 0)
+      m_baudRateCombo->setCurrentIndex(defaultIndex);
 
     m_connectButton = new QPushButton("Connect", this);
+    // Initially not connected: red background.
+    m_connectButton->setStyleSheet("background-color: red");
     connect(m_connectButton, &QPushButton::clicked, this, &MainWindow::onConnectButtonClicked);
 
     serialLayout->addWidget(m_portNameEdit);
-    serialLayout->addWidget(m_baudRateSpin);
+    serialLayout->addWidget(m_baudRateCombo);
     serialLayout->addWidget(m_connectButton);
-
     mainLayout->addLayout(serialLayout);
 
-    // Add the visualization widget.
+    // Visualization widget.
     m_visualizationWidget = new VisualizationWidget(this);
     mainLayout->addWidget(m_visualizationWidget);
 
-    // Add a horizontal slider.
+    // Horizontal slider.
     m_slider = new QSlider(Qt::Horizontal, this);
     mainLayout->addWidget(m_slider);
-
     connect(m_slider, &QSlider::valueChanged,
             m_visualizationWidget, &VisualizationWidget::setHorizontalOffset);
 
-    // Timer for periodic visualization updates.
+    // Timer for updating the visualization.
     QTimer *timer = new QTimer(this);
     connect(timer, &QTimer::timeout,
             m_visualizationWidget, QOverload<>::of(&VisualizationWidget::update));
     timer->start(16);
   }
 
+  void wheelEvent(QWheelEvent *event) override 
+  {
+    // Use horizontal scrolling delta if available; fallback to vertical.
+    int delta = event->angleDelta().x();
+    if (delta == 0)
+      delta = event->angleDelta().y();
+    int steps = delta;
+    int newValue = m_slider->value() - steps * m_slider->singleStep();
+    m_slider->setValue(newValue);
+    event->accept();
+  }
+
+  void closeEvent(QCloseEvent *event) override
+  {
+    g_stopReceiver = true;
+    if (g_receivingThread.joinable())
+      g_receivingThread.join();
+
+    event->accept();
+  }
+
   ~MainWindow()
   {
-    // Ensure that the receiver thread is stopped.
-    if(g_receivingThread != nullptr)
-    {
-      g_stopReceiver = true;
-      g_receivingThread->join();
-      delete g_receivingThread;
-      g_receivingThread = nullptr;
-    }
+    g_stopReceiver = true;
+    if (g_receivingThread.joinable())
+      g_receivingThread.join();
   }
 
 protected:
   void resizeEvent(QResizeEvent *event) override
   {
     QWidget::resizeEvent(event);
-
     const int segmentWidth = 50;
     const int leftMargin = 100;
     int totalWidth = leftMargin + PACKET_RECORD_COUNT * segmentWidth;
@@ -236,29 +293,32 @@ protected:
 private slots:
   void onConnectButtonClicked()
   {
-    // If a receiver thread is already running, stop it.
-    if(g_receivingThread != nullptr)
+    // Toggle connection state.
+    if (!g_connectionRequested.load())
     {
-      g_stopReceiver = true;
-      g_receivingThread->join();
-      delete g_receivingThread;
-      g_receivingThread = nullptr;
-      g_stopReceiver = false;
+      // User requests connection.
+      g_portName = m_portNameEdit->text().toStdString();
+      g_baudRate = m_baudRateCombo->currentData().toInt();
+      g_connectionRequested = true;
+      g_restartNeeded = true;
+      m_connectButton->setStyleSheet("background-color: green");
+      m_connectButton->setText("Disconnect");
     }
-
-    // Update the global serial settings from the UI.
-    g_portName = m_portNameEdit->text().toStdString();
-    g_baudRate = m_baudRateSpin->value();
-
-    // Start a new receiving thread.
-    g_receivingThread = new std::thread(receivingTracerDataThreadFunc);
+    else
+    {
+      // User requests disconnection.
+      g_connectionRequested = false;
+      g_restartNeeded = true;
+      m_connectButton->setStyleSheet("background-color: red");
+      m_connectButton->setText("Connect");
+    }
   }
 
 private:
   VisualizationWidget *m_visualizationWidget;
   QSlider *m_slider;
   QLineEdit *m_portNameEdit;
-  QSpinBox *m_baudRateSpin;
+  QComboBox *m_baudRateCombo;
   QPushButton *m_connectButton;
 };
 
@@ -266,11 +326,13 @@ int main(int argc, char *argv[])
 {
   QApplication app(argc, argv);
 
+  // Create a single persistent receiving thread.
+  g_receivingThread = std::thread(receivingTracerDataThreadFunc);
+
   MainWindow mainWindow;
-  mainWindow.setWindowTitle("Scheduling Visualization");
+  mainWindow.setWindowTitle("MicroKernel Tracer");
   mainWindow.resize(1280, 720);
   mainWindow.show();
-
   return app.exec();
 }
 
